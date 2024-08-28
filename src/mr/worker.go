@@ -4,6 +4,11 @@ import "fmt"
 import "log"
 import "net/rpc"
 import "hash/fnv"
+import "time"
+import "encoding/json"
+import "os"
+import "io"
+import "sort"
 
 
 //
@@ -13,6 +18,12 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+type ByKey []KeyValue
+
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -36,6 +47,110 @@ func Worker(mapf func(string, string) []KeyValue,
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
 
+	for {
+		args := RequestTaskArgs{}
+		reply := RequestTaskReply{}
+		ok := call("Coordinator.RequestTask", &args, &reply)
+		if ok {
+			switch reply.TaskType {
+			case mapTask:
+				mapWork(mapf, reply)
+			case reduceTask:
+				reduceWork(reducef, reply)
+			case waitTask:
+				time.Sleep(time.Second)
+			case exitTask:
+				return
+			}
+		} else {
+			time.Sleep(time.Second)
+		}
+	}
+}
+
+func mapWork(mapf func(string, string) []KeyValue, reply RequestTaskReply) {
+	filename := reply.InputFiles[0]
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", filename)
+	}
+	content, err := io.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", filename)
+	}
+	file.Close()
+	kva := mapf(filename, string(content))
+	nReduce := reply.NReduce
+	partitioned := make([][]KeyValue, nReduce, nReduce)
+	for _, kv := range kva {
+		i := ihash(kv.Key) % nReduce
+		partitioned[i] = append(partitioned[i], kv)
+	}
+	outputFiles := make([]string, nReduce, nReduce)
+	for i := 0; i < nReduce; i++ {
+		filename := fmt.Sprintf("mr-tmp-%v-%v-%v.txt", reply.Index, i, reply.CountOfSends)
+		file, err := os.Create(filename)
+		if err != nil {
+			log.Fatalf("cannot create %v:", filename)
+		}
+		enc := json.NewEncoder(file)
+		for _, kv := range partitioned[i] {
+			err := enc.Encode(&kv)
+			if err != nil {
+				log.Fatal("error: ", err)
+			}
+		}
+		outputFiles[i] = filename
+		file.Close()
+	}
+	submitArgs := SubmitTaskArgs{0, outputFiles, reply.Index}
+	submitReply := SubmitTaskReply{}
+	call("Coordinator.SubmitTask", &submitArgs, &submitReply)
+	return
+}
+
+func reduceWork(reducef func(string, []string) string, reply RequestTaskReply) {
+	intermediate := []KeyValue{}
+	for _, filename := range reply.InputFiles {
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Fatalf("cannot open %v", filename)
+		}
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			intermediate = append(intermediate, kv)
+		}
+		file.Close()
+	}
+	sort.Sort(ByKey(intermediate))
+	filename := fmt.Sprintf("mr-out-tmp-%v-%v.txt", reply.CountOfSends, reply.Index)
+	file, err := os.Create(filename)
+	if err != nil {
+		log.Fatalf("cannot create %v", filename)
+	}
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+		fmt.Fprintf(file, "%v %v\n", intermediate[i].Key, output)
+		i = j
+	}
+	file.Close()
+	submitArgs := SubmitTaskArgs{1, []string{filename}, reply.Index}
+	submitReply := SubmitTaskReply{}
+	call("Coordinator.SubmitTask", &submitArgs, &submitReply)
+	return
 }
 
 //
